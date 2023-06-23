@@ -1,6 +1,7 @@
 import time
 import boto3
 import requests
+import numpy as np
 import pandas as pd
 import awswrangler as wr
 import datetime as datetime
@@ -23,18 +24,59 @@ session = boto3.Session(
     region_name='eu-central-1'
 )
 
-def backfill_gaps(dates):
-    # check for any gaps among the partitions
+def backfill_historically(missing: list):
+    # iterate over the missing dates and backfill data
+    for date in missing:
+        # add S&P500 data for that date
+        df_sp500 = get_sp500_data(start_date=date, end_date=date, backfill=True)
+        df_sp500 = df_sp500[df_sp500['date'] == date]
+
+        # convert to date format so partitions look like YY-MM-DD
+        df_sp500['date'] = pd.to_datetime(df_sp500['date']).dt.date
+
+        if not df_sp500.empty:
+            # CPI data not available for today
+            df_sp500['cpi_level'] = float('nan')
+            df_sp500['cpi_annual_percentage_change'] = float('nan')
+
+            # store S&P500 data
+            store_data(df=df_sp500, path=S3_PATH, data_type='SP500', partitions=['date'])
+
+        # update CPI data for that date
+        update_cpi_data(last_updated=pd.Timestamp('2000-01-01'), dates=[date], historical=True)
+
+def find_partitions_gaps(dates: list) -> list:
+    # convert list of dates into a dataframe
     df = pd.DataFrame(dates)
     df.columns = ['date']
     df['date'] = pd.to_datetime(df['date'])
+
+    # sort dates and compute date differences between adjacent rows
     df.sort_values(by='date', inplace=True)
     df['date_diff'] = df.date.diff()
+
+    # obtain any potential gaps of more than 1 day
     gaps = df[df['date_diff'] > pd.Timedelta(days=1)]
 
     if not gaps.empty:
-        pass
-    print(gaps.head())
+        # extract the start dates for each gap
+        gap_start_dates = gaps['date'] - gaps['date_diff']
+
+        # initialize a list to store the missing dates
+        missing_dates = []
+
+        # iterate over the gaps and obtain missing dates
+        for start_date, end_date in zip(gap_start_dates, gaps['date']):
+            date_range = pd.date_range(start=start_date, end=end_date)
+            missing_dates.extend(date_range[(date_range != start_date) & (date_range != end_date)])
+
+        # convert missing dates to strings and raise warning
+        missing_dates = [date.strftime('%Y-%m-%d') for date in missing_dates]
+        print(f'Warning! We are missing data for the following dates: {missing_dates}')
+
+        return missing_dates
+    
+    return []
 
 def store_data(df: pd.DataFrame(), path: str, data_type: str, partitions: list = [], mode: str = 'append'):
     # initialize error counter
@@ -52,7 +94,7 @@ def store_data(df: pd.DataFrame(), path: str, data_type: str, partitions: list =
             time.sleep(30)
             error_counter += 1
 
-def process_data(data: dict, column_name: str) -> pd.DataFrame():
+def process_data(data: dict, column_name: str, backfill_date: str = '') -> pd.DataFrame:
     # get rid of unecessary columns
     df = pd.DataFrame(data).drop(columns=['realtime_start', 'realtime_end'])
 
@@ -71,6 +113,9 @@ def process_data(data: dict, column_name: str) -> pd.DataFrame():
         df['date_diff'] = df.date.diff()
         gaps = df[df['date_diff'] > pd.Timedelta(days=1)]
 
+        # get rid of date_diff column
+        df.drop(columns='date_diff', inplace=True)
+
         if not gaps.empty:
             # set the 'date' column as the DataFrame's index
             df.set_index('date', inplace=True)
@@ -79,22 +124,48 @@ def process_data(data: dict, column_name: str) -> pd.DataFrame():
             df.index = pd.DatetimeIndex(df.index)
 
             # forward-fill weekends and reset index
-            df = df.resample('D').ffill().drop(columns='date_diff')
+            df = df.resample('D').ffill()
             df.reset_index(inplace=True)
+
+        if df.date.max().strftime('%Y-%m-%d') < backfill_date:
+            # set the 'date' column as an index of the dataframe
+            df.set_index('date', inplace=True)
+
+            # convert the index to DatetimeIndex
+            df.index = pd.DatetimeIndex(df.index)
+
+            # add a dummy row with NaN values for all columns
+            dummy_row = pd.DataFrame([[float('nan')]], columns=df.columns, 
+                                     index=[datetime.datetime.strptime(backfill_date, '%Y-%m-%d')
+                                             + relativedelta(days=1)])
+
+            # append the new row to the DataFrame, which will allow us to resample the lastest month as well
+            df = pd.concat([df, dummy_row])
+
+            # resample the using daily frequency and forward-filling missing values
+            df = df.resample('D').ffill()
+
+            # drop the dummy row
+            df.drop(df.index[-1], inplace=True)
+
+            # reset the index and fix the name of the date column
+            df.reset_index(inplace=True)
+            df.rename(columns={'index': 'date'}, inplace=True)
 
     return df
 
-def get_sp500_data(start_date: str = (date.today() - relativedelta(years=2)).strftime('%Y-%m-%d')) -> pd.DataFrame():
+def get_sp500_data(start_date: str = (date.today() - relativedelta(years=2)).strftime('%Y-%m-%d'), 
+                   end_date: str = date.today().strftime('%Y-%m-%d'), backfill: bool = False) -> pd.DataFrame:
     # construct the URL for S&P 500 data and send the GET request
     start_date = (datetime.datetime.strptime(start_date, '%Y-%m-%d') - relativedelta(days=7)).strftime('%Y-%m-%d')
-    SP500_URL = f'https://api.stlouisfed.org/fred/series/observations?series_id=SP500&api_key={FRED_API_KEY}&observation_start={start_date}&sort_order=asc&file_type=json'
+    SP500_URL = f'https://api.stlouisfed.org/fred/series/observations?series_id=SP500&api_key={FRED_API_KEY}&observation_start={start_date}&observation_end={end_date}&sort_order=asc&file_type=json'
     response = requests.get(SP500_URL)
 
     # handle the response and obtain the data
     if response.status_code == 200:
         # extract the observations and process the data
         data_sp500 = response.json()['observations']
-        df_sp500 = process_data(data_sp500, 'sp500_daily_price')
+        df_sp500 = process_data(data_sp500, 'sp500_daily_price', end_date if backfill else '')
 
         # calculate the daily percentage change
         df_sp500['sp500_daily_percentage_change'] = df_sp500['sp500_daily_price'].pct_change(periods=1) * 100
@@ -108,7 +179,8 @@ def get_sp500_data(start_date: str = (date.today() - relativedelta(years=2)).str
 
 def format_cpi_data(df: pd.DataFrame()):
     # calculate annual percentage change using the monthly percentage changes
-    df['cpi_annual_percentage_change'] = (df['cpi_level'].pct_change(periods=1) * 100).rolling(window=12).sum()
+    df['cpi_annual_percentage_change'] = ((df['cpi_level'].pct_change(
+        periods=1) + 1).rolling(window=12).apply(np.prod, raw=True) - 1) * 100
 
     # set the 'date' column as an index of the dataframe
     df.set_index('date', inplace=True)
@@ -141,10 +213,11 @@ def format_cpi_data(df: pd.DataFrame()):
 
     return df
 
-def get_cpi_data(start_date: str = (date.today() - relativedelta(years=2)).strftime('%Y-%m-%d')) -> pd.DataFrame():
+def get_cpi_data(start_date: str = (date.today() - relativedelta(years=2)).strftime('%Y-%m-%d'), 
+                   end_date: str = date.today().strftime('%Y-%m-%d')) -> pd.DataFrame:
     # construct the URL for CPI data and send the GET request
     start_date = (datetime.datetime.strptime(start_date, '%Y-%m-%d') - relativedelta(months=13)).strftime('%Y-%m-%d')
-    CPI_URL = f'https://api.stlouisfed.org/fred/series/observations?series_id=CPIAUCSL&api_key={FRED_API_KEY}&observation_start={start_date}&sort_order=asc&file_type=json'
+    CPI_URL = f'https://api.stlouisfed.org/fred/series/observations?series_id=CPIAUCSL&api_key={FRED_API_KEY}&observation_start={start_date}&observation_end={end_date}&sort_order=asc&file_type=json'
     response = requests.get(CPI_URL)
 
     # handle the response and obtain the data
@@ -162,7 +235,7 @@ def get_cpi_data(start_date: str = (date.today() - relativedelta(years=2)).strft
 
         return pd.DataFrame()
 
-def update_cpi_data(last_updated: pd.Timestamp, dates: list):
+def update_cpi_data(last_updated: pd.Timestamp, dates: list, historical: bool = False):
     # construct the URL for CPI data and send the GET request
     start_date = (date.today() - relativedelta(months=15)).strftime('%Y-%m-%d')
     CPI_URL = f'https://api.stlouisfed.org/fred/series/observations?series_id=CPIAUCSL&api_key={FRED_API_KEY}&observation_start={start_date}&sort_order=asc&file_type=json'
@@ -174,7 +247,7 @@ def update_cpi_data(last_updated: pd.Timestamp, dates: list):
         data_cpi = response.json()['observations']
         latest_date = pd.Timestamp(data_cpi[-1]['date'])
 
-        last_updated = pd.Timestamp('2023-04-01') # REMOVE
+        # last_updated = pd.Timestamp('2023-04-01') # TODO: REMOVE
 
         # update CPI entries only if API returned new data
         if latest_date > last_updated:
@@ -183,8 +256,9 @@ def update_cpi_data(last_updated: pd.Timestamp, dates: list):
             df_cpi = format_cpi_data(df=df_cpi)
 
             # get the dates for which the new CPI data is valid
-            dates = [date for date in dates if datetime.datetime.strptime(date, '%Y-%m-%d') >= latest_date and
-                      datetime.datetime.strptime(date, '%Y-%m-%d') < latest_date + relativedelta(months=1)]
+            if not historical:
+                dates = [date for date in dates if datetime.datetime.strptime(date, '%Y-%m-%d') >= latest_date and
+                        datetime.datetime.strptime(date, '%Y-%m-%d') < latest_date + relativedelta(months=1)]
             
             # obtain the paths to iterate over
             paths = [S3_PATH + 'date=' + date + '/' for date in dates]
@@ -237,10 +311,8 @@ def main():
         # store S&P500 and CPI data
         store_data(df=df, path=S3_PATH, data_type='SP500 and CPI', partitions=['date'])
     else:
-        # backfill gaps only on Mondays
-        backfill_gaps(dates=dates)
         # add new S&P500 data
-        df_sp500 = get_sp500_data(dates[0])
+        df_sp500 = get_sp500_data(start_date=dates[0])
         df_sp500 = df_sp500[df_sp500['date'] > dates[0]]
 
         # convert to date format so partitions look like YY-MM-DD
@@ -260,10 +332,12 @@ def main():
         # check for new CPI data and update parquets if there is any
         update_cpi_data(last_updated=last_updated, dates=dates)
 
-        # backfill gaps only on Mondays
-        today = date.today()
-        if today.weekday == 0:
-            backfill_gaps()
+        # check for any partition gaps
+        gaps = find_partitions_gaps(dates=dates)
+
+        if gaps:
+            # backfill data if any gaps found
+            backfill_historically(missing=gaps)
 
         # trigger Glue crawl (recrawl all if cpi data was updated)
 
