@@ -367,7 +367,7 @@ def update_cpi_data(last_updated: pd.Timestamp, dates: list, historical: bool = 
 
     return False
 
-def main():
+def lambda_handler(event, context):
     try:
         # get most recent date from the partitions
         dates = wr.s3.list_directories(S3_PATH, boto3_session=session)
@@ -425,7 +425,7 @@ def main():
                               aws_secret_access_key=AWS_SECRET, region_name='eu-central-1')
         
         # recrawl all directories if there were any gaps or CPI data was updated
-        crawler = 'data-crawler-all' if is_cpi_udapted or gaps else 'data-crawler-new'
+        crawler = 'data-crawler' if is_cpi_udapted or gaps else 'data-crawler-new'
 
         try:
             response = client.start_crawler(Name=crawler)
@@ -434,6 +434,3 @@ def main():
             print(f"Glue crawler '{crawler}' is already running.")
         except Exception as e:
             print(f"Error trying to trigger Glue crawler: {e.__str__}")
-
-if __name__ == "__main__":
-    main()
