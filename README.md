@@ -1,6 +1,6 @@
 # Overview
 
-This solution to the ETL pipeline task for storing data fetched from the FRED API approaches the task at hand by utilizing various AWS services, all serving a different purpose for creating a robust, efficient, and reliable ETL pipeline. Namely, the services that this solution uses are: S3, Lambda, Glue, Athena, CloudWatch, and EventBridge. Additionally, all of the code is written in Python, data formatting is done with Pandas, and to connect to the Amazon services the AWS SDK for pandas (awswrangler) was used.
+This solution to the ETL pipeline task for storing data fetched from the FRED API approaches the task at hand by utilizing various AWS services, all serving a different purpose for creating a robust, efficient, and reliable ETL pipeline. Namely, the services that this solution uses are: **S3, Lambda, Glue, Athena, CloudWatch, and EventBridge**. Additionally, all of the code is written in Python, data formatting is done with Pandas, and to connect to the Amazon services the AWS SDK for pandas (awswrangler) was used.
 
 The following sections explain the design choices made when approaching this task, including the architecture of the solution, how the code should be ran, and the provided interface to access the data.
 
@@ -16,8 +16,6 @@ The dataset is updated on a daily basis on weekdays at 22:15 (UTC) to ensure we 
 
 The motivation behind using **Lambda** to run the script is that the execution time of the script does not go over a minute or so even in some exceptional cases (e.g., building the whole table from scratch). Lambdas are a cheap and convenient way to run scripts that execute for less than 15 minutes. In our case, it is sufficient to have **512 MB** of RAM memory and **1024 MB** of Ephemeral storage. Additionally, setting the runtime (**Python 3.10**) and layers (**AWSSDKPandas-Python310**) is quite straightforward as the ones available from the AWS interface suffice.
 
-Finally, it is necessary to run a Glue crawler so that
-
 ## Storage & Accessing Data
 
 **S3** was used to store the data for this task. The motivation behind this choice is that **S3** is really cheap and it allows for a fairly quick access to the data (when the data has been crawled by a **Glue** crawler to create an **Athena** table). One of the main drawbacks of using **S3** is that it is somewhat troublesome when having to edit the existing parquet files, but in this case this is not much of a problem. The reason for using parquet files is that they are pretty universal when it comes to storing data of most types and they are quite efficient in terms of disk space. Partitions (by date) are also used in this solution to optimize SQL queries when filtering data on specific dates.
@@ -32,6 +30,8 @@ The script also ensures that rate limit errors or other issues (such as network 
 
 ## Monitoring
 
-When it comes to monitoring, the solution makes use of the **CloudWatch** service provided by AWS, which is a very simple and yet an efficient way of keeping track of the execution of all processes. The biggest margin for error lies in the execution of the **Lambda** script and the **Glue** crawler, and **CloudWatch** keeps track of them both, providing the necessary logs with their respective timestamps.
+When it comes to monitoring, the solution makes use of the **CloudWatch** service provided by AWS, which is a very simple and yet an efficient way of keeping track of the execution of all processes. The biggest margin for error lies in the execution of the **Lambda** script and the **Glue** crawler, and **CloudWatch** keeps track of them both, providing the necessary logs with their respective timestamps. The below image provides an example of what the logs of running a **Lambda** script look like in **CloudWatch**:
+
+![Cloudwatch logs](/images/cloudwatch.png)
 
 A more sophisticated approach to monitoring these processes would be to implement **Airflow**, which will allow to break down the processes and keep track of their individual execution, significantly improving error readability.
